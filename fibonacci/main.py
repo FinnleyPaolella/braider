@@ -22,6 +22,9 @@ With three anyons the total-charge-tau sector is a qubit, |0> = ((t t)_1 t)_tau
 and |1> = ((t t)_tau t)_tau, and the gate buttons play braids that implement
 X, Y, Z, H, S and T: Z exactly, the others approximately (see gates.py).
 
+The anyons slider picks 3, 4 or 5 anyons; Reset (or R) starts over with that
+many.
+
 Keys:  space  play / pause   right  next step   R  reset   Esc  quit
 """
 
@@ -46,7 +49,7 @@ from steps import (
     anyon, plan,
 )
 
-N = 3  # number of particles
+N_MIN, N_MAX = 3, 5   # the range of the anyons slider
 
 # ----------------------------------------------------------------------
 # layout
@@ -62,7 +65,7 @@ WINDOW_H = 1060
 MARGIN = 40            # around the window's right and bottom edges
 PANEL_GAP = 20         # between the panels on the right
 CARD_H = 260           # the step-by-step explanation card
-CONTROLS_H = 262
+CONTROLS_H = 360
 GATES_H = 112          # the gate buttons, added to the controls for N = 3
 
 ARROW_R = SPACING / 2 - PARTICLE_R - 10   # radius of the arrow arcs
@@ -294,12 +297,9 @@ class App:
         _enable_dpi_awareness()
         pygame.init()
         pygame.display.set_caption("Fibonacci anyons")
-        self.panel_w = LEFT_MARGIN + max(
-            PANEL_MIN_W, round((N - 1) * SPACING + 2 * PANEL_PAD)
-        )
         info = pygame.display.Info()
         ref_w = self.ref_width()
-        want_w = self.panel_w + MID_W + 2 * MARGIN + ref_w
+        want_w = self.panel_width(N_MAX) + MID_W + 2 * MARGIN + ref_w
         w = min(want_w, max(1200, info.current_w - 60)) if info.current_w > 0 else want_w
         h = min(WINDOW_H, max(800, info.current_h - 110)) if info.current_h > 0 else WINDOW_H
         page = webcanvas.viewport()
@@ -311,13 +311,6 @@ class App:
         f = render.fonts()
         self.particle_tau = render.tau_glyph(26)
 
-        x0 = (LEFT_MARGIN + self.panel_w) / 2 - (N - 1) * SPACING / 2
-        self.xs = [x0 + i * SPACING for i in range(N)]
-        self.arrows = [
-            Arrow(g, side, (self.xs[g] + self.xs[g + 1]) / 2, ROW_Y)
-            for g in range(N - 1)
-            for side in (+1, -1)
-        ]
         self.braid_top = ROW_Y + ARROW_R + ARROW_HEAD_W + BRAID_GAP
         self.hand_cursor = False
 
@@ -330,17 +323,39 @@ class App:
         self.next_btn = ui.Button(icon=ui.icon_next)
         self.play_btn = ui.Button(icon=lambda s, r, c: ui.icon_play_pause(s, r, c, self.play_anim))
         self.play_anim = 0.0     # 0 = play icon, 1 = pause icon
-        # single-qubit gates, for the qubit of three anyons
-        self.gate_buttons = {name: ui.Button(name) for name in GATES} if N == 3 else {}
-        self.swap_seconds = SWAP_SECONDS
+        self.count = ui.Slider(f.ui, f.ui_bold, 0,
+                               stops=[str(n) for n in range(N_MIN, N_MAX + 1)])
+        self.reset_btn = ui.Button("Reset")
         self.clock_t = 0.0
 
         self._images: dict[tuple, pygame.Surface] = {}
         self.reset()
 
+    @staticmethod
+    def panel_width(n: int) -> int:
+        return LEFT_MARGIN + max(PANEL_MIN_W, round((n - 1) * SPACING + 2 * PANEL_PAD))
+
+    def chosen_n(self) -> int:
+        return N_MIN + int(self.count.value)
+
     def reset(self) -> None:
-        self.order = list(range(N))       # particle id in each slot
-        self.state = initial_state(N)
+        """Start over with the number of anyons chosen on the slider."""
+        self.n = n = self.chosen_n()
+        self.panel_w = self.panel_width(n)
+        x0 = (LEFT_MARGIN + self.panel_w) / 2 - (n - 1) * SPACING / 2
+        self.xs = [x0 + i * SPACING for i in range(n)]
+        self.arrows = [
+            Arrow(g, side, (self.xs[g] + self.xs[g + 1]) / 2, ROW_Y)
+            for g in range(n - 1)
+            for side in (+1, -1)
+        ]
+        # single-qubit gates, for the qubit of three anyons
+        self.gate_buttons = {name: ui.Button(name) for name in GATES} if n == 3 else {}
+        self.swap_seconds = SWAP_SECONDS
+        self._images.clear()
+
+        self.order = list(range(n))       # particle id in each slot
+        self.state = initial_state(n)
         self.view = View.still(Display(self.state))
         self.history: list[Swap] = []      # completed exchanges, oldest first
         self.active: Swap | None = None
@@ -388,6 +403,8 @@ class App:
         self.autoplay.rect = pygame.Rect(x1, top + 4, col_w, 30)
         self.always_std.rect = pygame.Rect(x1, top + 44, col_w, 30)
         self.to_std.rect = pygame.Rect(x1, top + 100, col_w, 42)
+        self.count.rect = pygame.Rect(x0 + 12, top + 210, col_w - 24, 6)
+        self.reset_btn.rect = pygame.Rect(x1, top + 192, col_w, 42)
         if self.gate_buttons:
             gap = 10
             bw = (c.w - 2 * pad - gap * (len(self.gate_buttons) - 1)) // len(self.gate_buttons)
@@ -549,8 +566,12 @@ class App:
         self.play_anim = ui.approach(self.play_anim, 1.0 if playing else 0.0, dt, 10)
         for b in self.gate_buttons.values():
             b.enabled = not self.busy() and not self.queue
-        for w in (self.detail, self.speed, self.autoplay, self.always_std,
-                  self.to_std, self.next_btn, self.play_btn, *self.gate_buttons.values()):
+        n = self.chosen_n()
+        self.reset_btn.label = "Reset" if n == self.n else f"Reset to {n} anyons"
+        self.reset_btn.primary = n != self.n
+        for w in (self.detail, self.speed, self.count, self.autoplay, self.always_std,
+                  self.to_std, self.reset_btn, self.next_btn, self.play_btn,
+                  *self.gate_buttons.values()):
             w.update(mouse, dt)
 
         hovered = self.arrow_at(mouse)
@@ -562,7 +583,8 @@ class App:
                 a.hover = ui.approach(a.hover, 1.0 if a is hovered else 0.0, dt)
         over_button = any(
             b.enabled and b.rect.collidepoint(mouse)
-            for b in (self.to_std, self.next_btn, self.play_btn, *self.gate_buttons.values())
+            for b in (self.to_std, self.reset_btn, self.next_btn, self.play_btn,
+                      *self.gate_buttons.values())
         ) or any(c.rect.collidepoint(mouse) for c in (self.autoplay, self.always_std))
         want_hand = hovered is not None or over_button
         if want_hand != self.hand_cursor:
@@ -610,6 +632,8 @@ class App:
                 self.request(Task())
         elif self.to_std.hit(pos):
             self.request(Task())
+        elif self.reset_btn.hit(pos):
+            self.reset()
         elif self.next_btn.hit(pos):
             self.advance()
         elif self.play_btn.hit(pos):
@@ -658,7 +682,7 @@ class App:
             scale = 1.0
             while True:
                 img, anchors = render.state_expression(
-                    N, d.state, max_w / scale, d.hl, d.phases, blank_phases)
+                    self.n, d.state, max_w / scale, d.hl, d.phases, blank_phases)
                 if img.get_height() * scale <= max_h or scale <= 0.3:
                     break
                 scale -= 0.05
@@ -872,7 +896,8 @@ class App:
         surf = self.screen
         pygame.draw.rect(surf, PANEL_BG, c, border_radius=18)
         surf.blit(f.heading.render("Controls", True, INK), (c.x + 28, c.y + 22))
-        caps = [("DETAIL", self.detail), ("STEP SPEED", self.speed)]
+        caps = [("DETAIL", self.detail), ("STEP SPEED", self.speed),
+                ("ANYONS", self.count)]
         for text, slider in caps:
             surf.blit(f.caps.render(text, True, INK_SOFT),
                       (slider.rect.x - 12, slider.rect.y - 30))
@@ -880,6 +905,7 @@ class App:
         self.autoplay.draw(surf, f.ui)
         self.always_std.draw(surf, f.ui)
         self.to_std.draw(surf, f.ui_bold)
+        self.reset_btn.draw(surf, f.ui_bold)
         if not self.gate_buttons:
             return
 
@@ -983,7 +1009,7 @@ class App:
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
                     return
-                if self.detail.handle(ev) or self.speed.handle(ev):
+                if self.detail.handle(ev) or self.speed.handle(ev) or self.count.handle(ev):
                     continue
                 if ev.type == pygame.KEYDOWN:
                     if ev.key == pygame.K_ESCAPE:
