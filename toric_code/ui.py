@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Callable
@@ -69,6 +70,19 @@ class Fonts:
         self.state = f(19)
         self.state_bold = f(19, True)
         self.caption = f(14)
+        # subscripts for the fonts that set formulas, see math_at
+        self._sub = {
+            id(self.state): f(13),
+            id(self.state_bold): f(13, True),
+            id(self.caption): f(11),
+            id(self.label): f(11),
+            id(self.label_bold): f(11, True),
+            id(self.small): f(10),
+        }
+
+    def sub(self, font: pygame.font.Font) -> pygame.font.Font:
+        """The subscript font that goes with font."""
+        return self._sub[id(font)]
 
 
 def rounded(
@@ -98,6 +112,107 @@ def text_at(
 def blend(a, b, t: float):
     t = max(0.0, min(1.0, t))
     return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+# ----------------------------------------------------------------------
+# formulas: X_12 and (X_1)_L get real subscripts, |00_L> a proper angle bracket
+# ----------------------------------------------------------------------
+_MATH = re.compile(r"_\{([^}]*)\}|_([A-Za-z0-9]+)|(\|)|(>)|([^_|>]+|_)")
+
+
+def _math_runs(s: str) -> list[tuple[str, str]]:
+    """Split ``s`` into ``(kind, text)`` runs: 'text', 'sub' or 'rangle'.
+
+    A ``>`` only closes a ket when a ``|`` opened one, so arrows stay arrows.
+    """
+    runs: list[tuple[str, str]] = []
+    in_ket = False
+    for m in _MATH.finditer(s):
+        braced, bare, bar, gt, plain = m.groups()
+        if braced is not None or bare is not None:
+            runs.append(("sub", braced if braced is not None else bare))
+        elif bar is not None:
+            in_ket = True
+            runs.append(("text", "|"))
+        elif gt is not None:
+            runs.append(("rangle", "") if in_ket else ("text", ">"))
+            in_ket = False
+        else:
+            runs.append(("text", plain))
+    return runs
+
+
+def _rangle_box(font: pygame.font.Font) -> tuple[int, int, int]:
+    """Width, and top/bottom offsets from the text top, of a ket's closing bracket."""
+    _, _, miny, maxy, _ = font.metrics("|")[0]
+    top = font.get_ascent() - maxy
+    bottom = font.get_ascent() - miny
+    return max(5, round((bottom - top) * 0.3)), top, bottom
+
+
+def math_size(font: pygame.font.Font, sub: pygame.font.Font, s: str) -> tuple[int, int]:
+    w = 0
+    for kind, text in _math_runs(s):
+        if kind == "sub":
+            w += sub.size(text)[0]
+        elif kind == "rangle":
+            w += _rangle_box(font)[0] + 2
+        else:
+            w += font.size(text)[0]
+    return w, font.get_height()
+
+
+_rangle_cache: dict = {}
+
+
+def _rangle(surf, color, x: float, y: float, font: pygame.font.Font) -> None:
+    """Draw a thin anti-aliased ``⟩`` (few UI fonts have the glyph)."""
+    w, top, bottom = _rangle_box(font)
+    h = bottom - top
+    stroke = max(1.4, h / 12) * (1.3 if font.get_bold() else 1.0)
+    key = (w, h, round(stroke * 4), tuple(color))
+    img = _rangle_cache.get(key)
+    if img is None:
+        ss = 4
+        pad = 2
+        big = pygame.Surface(((w + 2 * pad) * ss, (h + 2 * pad) * ss), pygame.SRCALPHA)
+        pts = [(pad * ss, pad * ss), ((pad + w) * ss, (pad + h / 2) * ss),
+               (pad * ss, (pad + h) * ss)]
+        pygame.draw.lines(big, color, False, pts, max(1, round(stroke * ss)))
+        for p in pts:  # round the stroke ends and the joint
+            pygame.draw.circle(big, color, p, stroke * ss / 2)
+        img = pygame.transform.smoothscale(big, (w + 2 * pad, h + 2 * pad))
+        _rangle_cache[key] = img
+    surf.blit(img, (round(x) - 1, round(y + top) - 2))
+
+
+def math_at(
+    surf: pygame.Surface,
+    font: pygame.font.Font,
+    sub: pygame.font.Font,
+    s: str,
+    color,
+    pos: tuple[float, float],
+    anchor: str = "topleft",
+) -> pygame.Rect:
+    """Like ``text_at``, but typesets subscripts and ket brackets."""
+    w, h = math_size(font, sub, s)
+    rect = pygame.Rect(0, 0, w, h)
+    setattr(rect, anchor, (round(pos[0]), round(pos[1])))
+    x, y = rect.x, rect.y
+    # subscript baseline sits a little below the main one
+    sub_y = y + font.get_ascent() - sub.get_ascent() + round(font.get_height() * 0.2)
+    for kind, text in _math_runs(s):
+        if kind == "sub":
+            surf.blit(sub.render(text, True, color), (x, sub_y))
+            x += sub.size(text)[0]
+        elif kind == "rangle":
+            _rangle(surf, color, x, y, font)
+            x += _rangle_box(font)[0] + 2
+        else:
+            surf.blit(font.render(text, True, color), (x, y))
+            x += font.size(text)[0]
+    return rect
 
 
 # ----------------------------------------------------------------------

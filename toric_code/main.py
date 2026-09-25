@@ -16,8 +16,9 @@ import sys
 import pygame
 
 from lattice import TorusLattice
-from pauli import PauliWord, phase_prefix
+from pauli import PauliWord, ket_label, phase_prefix
 from simplify import build_reduce_script, build_script
+from tutorial import TutorialOverlay
 from viewer3d import WorldlinePanel
 from worldlines import WorldlineTracker
 import webcanvas
@@ -25,7 +26,7 @@ from ui import (
     ACCENT, BG, E_COL, GATE_COL, GLOW, GRID, GRID_GHOST, HAIRLINE, INK,
     INK_FAINT, INK_SOFT, M_COL, PANEL, WHITE, X_COL, Y_COL, Z_COL,
     Button, Fonts, aa_circle, blend, icon_close, icon_next, icon_pause,
-    icon_play, icon_prev, icon_check, rounded, text_at,
+    icon_play, icon_prev, icon_check, math_at, math_size, rounded, text_at,
 )
 
 L = 8
@@ -107,6 +108,7 @@ class App:
         # in the browser the page is the limit, so the grid shrinks instead
         self.max_W = self.W if page else max(self.W, min(2200, info.current_w - 60))
         self.world = WorldlinePanel(self.lat, self.tracker, self.fonts)
+        self.tutorial: TutorialOverlay | None = None  # set while the card is open
         self._layout_grid()
         self._build_buttons()
 
@@ -189,6 +191,12 @@ class App:
             y += 46
         self.panel_info_y = y + 10
 
+        # beside the panel title
+        self.buttons["Tutorial"] = Button(
+            "Tutorial", "Tutorial", pygame.Rect(self.W - 26 - 84, 34, 84, 32),
+            fill=(238, 240, 243),
+        )
+
         # transport, bottom right
         bx = self.W - 40
         by = self.H - 58
@@ -214,11 +222,12 @@ class App:
     def current_snapshot(self):
         return self.script.snapshots[self.step] if self.script else None
 
-    def display_word(self) -> tuple[list, complex]:
+    def display_word(self) -> tuple[list, complex, tuple[int, int], list]:
+        """Factors, phase and ket of the equation, plus any further ``=`` links."""
         if self.script:
             s = self.current_snapshot()
-            return s.factors, s.phase
-        return self.word.factors, self.word.phase
+            return s.factors, s.phase, s.ket, s.chain
+        return self.word.factors, self.word.phase, self.word.ket, []
 
     def display_net(self) -> dict[int, str]:
         if self.script:
@@ -313,10 +322,12 @@ class App:
     def close_script(self) -> None:
         if self.script and self.step == len(self.script.snapshots) - 1:
             last = self.script.snapshots[-1]
+            final = last.chain[-1] if last.chain else last
             self.push_undo()
             self.tracker.begin_step()
-            self.word.factors = list(last.factors)
-            self.word.phase = last.phase
+            self.word.factors = list(final.factors)
+            self.word.phase = final.phase
+            self.word.ket = final.ket
             self.message = "Simplified."
         else:
             self.message = "Simplification cancelled."
@@ -565,7 +576,7 @@ class App:
             else:
                 self.message = "Nothing to undo."
         elif key == "Clear":
-            if self.word.factors or not self.tracker.is_empty():
+            if self.word.factors or self.word.ket != (0, 0) or not self.tracker.is_empty():
                 self.push_undo()
                 self.tracker.begin_reset_step()
             self.word.clear()
@@ -584,6 +595,10 @@ class App:
             self.goto_step(-1)
         elif key == "Close":
             self.close_script()
+        elif key == "Tutorial":
+            self.tutorial = TutorialOverlay(self.fonts)
+            for b in self.buttons.values():
+                b.hover = False
 
     def on_key(self, event) -> None:
         k = event.key
@@ -612,6 +627,8 @@ class App:
                 self.on_button(mapping[k])
 
     def _button_visible(self, key: str) -> bool:
+        if key == "Tutorial":
+            return True
         transport = key in ("Play", "Next", "Prev", "Close")
         if transport:
             return self.animating
@@ -664,6 +681,8 @@ class App:
             self.world.draw(self.screen, self.world_rect())
         self.draw_panel()
         self.draw_bottom()
+        if self.tutorial is not None:
+            self.tutorial.draw(self.screen)
         pygame.display.flip()
 
     def draw_grid(self) -> None:
@@ -840,11 +859,15 @@ class App:
                 head, sub = "Same-qubit reduction", "gather, then multiply out"
             elif kind == "pair":
                 head, sub = "Repeated factor", "same qubit, same letter"
+            elif kind in ("XL", "ZL"):
+                head = f"Non-contractible {kind[0]}-loop"
+                sub = "logical operator: winds round the torus"
             else:
                 head = f"Contractible {kind}-loop"
                 sub = "product of " + ("stars A_v" if kind == "X" else "plaquettes B_p")
             text_at(surf, self.fonts.label_bold, head, INK, (x0 + 26, y))
-            text_at(surf, self.fonts.small, sub, INK_SOFT, (x0 + 26, y + 22))
+            math_at(surf, self.fonts.small, self.fonts.sub(self.fonts.small), sub,
+                    INK_SOFT, (x0 + 26, y + 22))
             y += 54
 
             labels = sorted(q + 1 for q in self.script.loop_qubits)
@@ -868,8 +891,9 @@ class App:
             y += 16
             text_at(surf, self.fonts.tiny, "PHASE", INK_FAINT, (x0 + 26, y))
             y += 20
-            name = {1: "+1", -1: "-1", 1j: "+i", -1j: "-i"}.get(snap.phase, str(snap.phase))
-            col = X_COL if snap.phase in (-1, -1j) else INK
+            phase = snap.chain[-1].phase if snap.chain else snap.phase
+            name = {1: "+1", -1: "-1", 1j: "+i", -1j: "-i"}.get(phase, str(phase))
+            col = X_COL if phase in (-1, -1j) else INK
             text_at(surf, self.fonts.title, name, col, (x0 + 26, y))
             y += 40
 
@@ -900,7 +924,8 @@ class App:
             ("A_v", "X X X X   star", X_COL),
             ("B_p", "Z Z Z Z   plaquette", Z_COL),
         ):
-            text_at(surf, self.fonts.label_bold, label, col, (x0 + 26, y))
+            math_at(surf, self.fonts.label_bold, self.fonts.sub(self.fonts.label_bold),
+                    label, col, (x0 + 26, y))
             text_at(surf, self.fonts.small, formula, INK_SOFT, (x0 + 66, y + 2))
             y += 23
 
@@ -952,52 +977,73 @@ class App:
                 f"STEP {self.step + 1} / {len(self.script.snapshots)}",
                 INK_FAINT, (40, cap_y - 20),
             )
-        text_at(surf, self.fonts.caption, caption, INK_SOFT, (40, cap_y))
+        math_at(surf, self.fonts.caption, self.fonts.sub(self.fonts.caption), caption,
+                INK_SOFT, (40, cap_y))
 
         for key in ("Prev", "Play", "Next", "Close"):
             if self._button_visible(key):
                 self.buttons[key].draw(surf, self.fonts)
 
-    def token_layout(self, factors, phase, area: pygame.Rect):
-        """Lay the word out as wrapped tokens -> {key: (x, y, w, h, text, bold)}."""
-        font = self.fonts.state
-        out: dict = {}
-        x, y = area.x, area.y
+    def token_layout(self, factors, phase, ket, chain, area: pygame.Rect):
+        """Lay the equation out as wrapped tokens -> {key: (x, y, w, h, text, bold)}.
+
+        The main expression keys its factors by uid, so they can glide between
+        steps; each further ``= ...`` link ``i`` keys its tokens by ``(i, ...)``.
+        """
         gap = 9
-
-        def place(key, s, bold=False):
-            nonlocal x, y
-            f = self.fonts.state_bold if bold else font
-            w, h = f.size(s)
-            if x > area.x and x + w > area.right:
-                x = area.x
-                y += LINE_H
-            out[key] = (x, y, w, h, s, bold)
-            x += w + gap
-
+        # (key, text, bold, glue): a glued token never ends a line on its own
+        tokens: list[tuple] = []
         prefix = phase_prefix(phase)
         if prefix:
-            place("__phase", prefix, True)
-        for f in factors:
-            place(f.uid, f.label())
-        place("__ket", "|00_L>", True)
+            tokens.append(("__phase", prefix, True, True))
+        tokens += [(f.uid, f.label(), False, False) for f in factors]
+        tokens.append(("__ket", ket_label(ket), True, False))
+        for i, seg in enumerate(chain):
+            tokens.append(((i, "="), "=", False, True))
+            prefix = phase_prefix(seg.phase)
+            if prefix:
+                tokens.append(((i, "phase"), prefix, True, True))
+            tokens += [((i, f.uid), f.label(), False, False) for f in seg.factors]
+            tokens += [((i, "op", j), op, False, False) for j, op in enumerate(seg.ops)]
+            tokens.append(((i, "ket"), ket_label(seg.ket), True, False))
+
+        sizes = []
+        for _, s, bold, _ in tokens:
+            f = self.fonts.state_bold if bold else self.fonts.state
+            sizes.append(math_size(f, self.fonts.sub(f), s))
+
+        out: dict = {}
+        x, y = area.x, area.y
+        for k, (key, s, bold, _) in enumerate(tokens):
+            # room needed before the next possible break
+            need = sizes[k][0]
+            j = k
+            while tokens[j][3] and j + 1 < len(tokens):
+                j += 1
+                need += gap + sizes[j][0]
+            if x > area.x and x + need > area.right:
+                x = area.x
+                y += LINE_H
+            w, h = sizes[k]
+            out[key] = (x, y, w, h, s, bold)
+            x += w + gap
         n_lines = (y - area.y) // LINE_H + 1
         return out, n_lines
 
     def draw_state_line(self, area: pygame.Rect) -> None:
         surf = self.screen
-        factors, phase = self.display_word()
-        layout, n_lines = self.token_layout(factors, phase, area)
+        factors, phase, ket, chain = self.display_word()
+        layout, n_lines = self.token_layout(factors, phase, ket, chain, area)
 
         prev_layout = {}
         snap = self.current_snapshot()
         if self.script and self.step > 0 and self.tween < 1.0:
             p = self.script.snapshots[self.step - 1]
-            prev_layout = self.token_layout(p.factors, p.phase, area)[0]
+            prev_layout = self.token_layout(p.factors, p.phase, p.ket, p.chain, area)[0]
 
-        # keep the interesting token on screen
+        # keep the interesting token on screen; a growing chain is at the end
         focus_line = None
-        if snap is not None:
+        if snap is not None and not snap.chain:
             focus = snap.moving
             if focus is not None and focus in layout:
                 focus_line = (layout[focus][1] - area.y) // LINE_H
@@ -1015,7 +1061,15 @@ class App:
         surf.set_clip(area.inflate(24, 10))
 
         t = _ease(self.tween)
-        highlight = snap.highlight if snap else set()
+        highlight = set(snap.highlight) if snap else set()
+        if snap is not None and snap.chain:
+            # mark what the newest link introduced: the logical operator, or
+            # the ket it produced
+            i = len(snap.chain) - 1
+            last = snap.chain[-1]
+            highlight |= {(i, "op", j) for j in range(len(last.ops))}
+            if not last.ops:
+                highlight.add((i, "ket"))
         flash = snap.flash if snap else set()
         moving = snap.moving if snap else None
 
@@ -1064,7 +1118,7 @@ class App:
             if alpha < 1.0:
                 col = blend(BG, col, alpha)
             font = self.fonts.state_bold if bold else self.fonts.state
-            text_at(surf, font, s, col, (px, py))
+            math_at(surf, font, self.fonts.sub(font), s, col, (px, py))
 
         surf.set_clip(clip)
 
@@ -1085,6 +1139,12 @@ class App:
         """Route one event. Returns False when the app should quit."""
         if event.type == pygame.QUIT:
             return False
+
+        # the tutorial card swallows all input until it is closed
+        if self.tutorial is not None:
+            if self.tutorial.handle(event):
+                self.tutorial = None
+            return True
 
         # the worldline panel owns the mouse while the cursor is over it, and
         # keeps it for the rest of an orbit drag even if the cursor leaves

@@ -1,4 +1,4 @@
-"""The operator word applied to |00_L>.
+"""The operator word applied to a logical basis state, initially |00_L>.
 
 A factor is a single-qubit ``X``, ``Y`` or ``Z``. Ordering: ``word[0]`` is the
 leftmost factor and is applied *last*; the rightmost factor acts first on
@@ -8,6 +8,9 @@ The global phase starts at +1 and only moves when the simplifier does something
 to earn it: a sign from commuting two factors that anticommute, or the ``i`` in
 ``Y = i X Z`` when a Y has to be split so a loop can take its X part. Keeping
 phase out of plain editing is what makes "erase this qubit" well defined.
+
+The ket ``|ab_L>`` only changes when the simplifier absorbs a non-contractible
+loop: an X-loop flips a logical bit, a Z-loop reads one off as a sign.
 """
 
 from __future__ import annotations
@@ -60,12 +63,18 @@ def phase_prefix(phase: complex) -> str:
     return f"({phase})"
 
 
+def ket_label(ket: tuple[int, int]) -> str:
+    """The logical basis state as text, e.g. ``|10_L>``."""
+    return f"|{ket[0]}{ket[1]}_L>"
+
+
 class PauliWord:
     """An ordered product of single-qubit X/Z factors times a global phase."""
 
     def __init__(self) -> None:
         self.factors: list[Factor] = []
         self.phase: complex = 1
+        self.ket: tuple[int, int] = (0, 0)  # logical basis state |ab_L>
 
     # ------------------------------------------------------------------
     # editing
@@ -74,6 +83,7 @@ class PauliWord:
         other = PauliWord()
         other.factors = list(self.factors)
         other.phase = self.phase
+        other.ket = self.ket
         return other
 
     def apply_gate(self, qubit: int, gate: str) -> None:
@@ -92,6 +102,7 @@ class PauliWord:
     def clear(self) -> None:
         self.factors.clear()
         self.phase = 1
+        self.ket = (0, 0)
 
     # ------------------------------------------------------------------
     # evaluation
@@ -126,10 +137,10 @@ class PauliWord:
         """The literal word, left to right, without the ket."""
         return [f.label() for f in self.factors]
 
-    def text(self, ket: str = "|00_L>") -> str:
+    def text(self) -> str:
         parts = [phase_prefix(self.phase)] if phase_prefix(self.phase) else []
         parts += self.tokens()
-        parts.append(ket)
+        parts.append(ket_label(self.ket))
         return " ".join(parts)
 
 

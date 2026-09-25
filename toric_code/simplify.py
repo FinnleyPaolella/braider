@@ -12,14 +12,25 @@ logical loop is rejected automatically, because cutting a torus along one
 homologically nontrivial cycle leaves it connected.
 
 Z-type loops are the same computation on the dual graph (faces as nodes).
+
+Non-contractible loops -- the logical operators -- are found separately, as the
+shortest cycle in the support whose homology class is nonzero. The class is read
+off by counting, mod 2, how often the cycle crosses a fixed representative of
+each conjugate logical operator. The logical qubits are
+
+    (Z_1)_L = Z on the horizontal edges of row 0      (a primal loop along x)
+    (X_1)_L = X on the horizontal edges of column 0   (a dual loop along y)
+    (Z_2)_L = Z on the vertical edges of column 0     (a primal loop along y)
+    (X_2)_L = X on the vertical edges of row 0        (a dual loop along x)
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
 from lattice import TorusLattice
-from pauli import Factor, PauliWord, _reduce_letters, _snap, anticommute
+from pauli import Factor, PauliWord, _reduce_letters, _snap, anticommute, ket_label
 
 
 # ----------------------------------------------------------------------
@@ -97,6 +108,82 @@ def find_z_loop(lat: TorusLattice, net: dict[int, str]) -> set[int] | None:
     return _smallest_boundary(lat.n_faces, lat.edge_faces, support, lat.face_incident)
 
 
+def _shortest_logical_cycle(
+    incidence: list[tuple[int, int]],
+    support: set[int],
+    node_edges: list[list[int]],
+    cuts: tuple[set[int], set[int]],
+) -> tuple[set[int], tuple[int, int]] | None:
+    """Shortest homologically nontrivial cycle inside ``support``.
+
+    Breadth-first search on the four-sheeted cover of the support graph: the
+    sheet records the parity of crossings with each of the two ``cuts``, and a
+    walk from ``(s, 0)`` back to ``s`` on another sheet is a nontrivial cycle.
+    The shortest such walk is a simple cycle. Returns ``(qubits, (c1, c2))``.
+    """
+    def sheet(q: int) -> int:
+        return (q in cuts[0]) | ((q in cuts[1]) << 1)
+
+    best: set[int] | None = None
+    for start in sorted({n for q in support for n in incidence[q]}):
+        prev: dict[tuple[int, int], tuple[int, int, int] | None] = {(start, 0): None}
+        queue = deque([(start, 0)])
+        end = None
+        while queue and end is None:
+            node, c = queue.popleft()
+            for q in node_edges[node]:
+                if q not in support:
+                    continue
+                a, b = incidence[q]
+                nxt = (b if a == node else a, c ^ sheet(q))
+                if nxt in prev:
+                    continue
+                prev[nxt] = (node, c, q)
+                if nxt[0] == start and nxt[1]:
+                    end = nxt
+                    break
+                queue.append(nxt)
+        if end is None:
+            continue
+        cycle: set[int] = set()
+        state = end
+        while prev[state] is not None:
+            node, c, q = prev[state]
+            cycle ^= {q}
+            state = (node, c)
+        if best is None or len(cycle) < len(best):
+            best = cycle
+    if best is None:
+        return None
+    return best, (len(best & cuts[0]) % 2, len(best & cuts[1]) % 2)
+
+
+def find_logical_x_loop(
+    lat: TorusLattice, net: dict[int, str]
+) -> tuple[set[int], tuple[int, int]] | None:
+    """A non-contractible X-loop (on the dual lattice) and its logical class."""
+    support = {q for q, letter in net.items() if letter in ("X", "Y")}
+    if not support:
+        return None
+    L = lat.L
+    # crossings with (Z_1)_L and (Z_2)_L
+    cuts = ({lat.h(x, 0) for x in range(L)}, {lat.v(0, y) for y in range(L)})
+    return _shortest_logical_cycle(lat.edge_faces, support, lat.face_incident, cuts)
+
+
+def find_logical_z_loop(
+    lat: TorusLattice, net: dict[int, str]
+) -> tuple[set[int], tuple[int, int]] | None:
+    """A non-contractible Z-loop (on the primal lattice) and its logical class."""
+    support = {q for q, letter in net.items() if letter in ("Z", "Y")}
+    if not support:
+        return None
+    L = lat.L
+    # crossings with (X_1)_L and (X_2)_L
+    cuts = ({lat.h(0, y) for y in range(L)}, {lat.v(x, 0) for x in range(L)})
+    return _shortest_logical_cycle(lat.edge_vertices, support, lat.vertex_incident, cuts)
+
+
 def find_pair(word: PauliWord) -> tuple[Factor, Factor] | None:
     """Two factors with the same qubit and letter, i.e. a plain cancellation."""
     seen: dict[tuple[int, str], Factor] = {}
@@ -112,6 +199,16 @@ def find_pair(word: PauliWord) -> tuple[Factor, Factor] | None:
 # animation script
 # ----------------------------------------------------------------------
 @dataclass
+class Segment:
+    """A further ``= ...`` link of the equation, drawn after the main one."""
+
+    phase: complex
+    factors: list[Factor]
+    ket: tuple[int, int]
+    ops: list[str] = field(default_factory=list)  # logical operators, e.g. "(X_1)_L"
+
+
+@dataclass
 class Snapshot:
     """The complete rendered state at one step of the animation."""
 
@@ -123,16 +220,18 @@ class Snapshot:
     moving: int | None = None                          # uid gliding on this step
     bracket: tuple[int, int] | None = None             # inclusive index range
     loop_qubits: set[int] = field(default_factory=set)
+    ket: tuple[int, int] = (0, 0)
+    chain: list[Segment] = field(default_factory=list)  # later links, if any
 
 
 @dataclass
 class Script:
     snapshots: list[Snapshot]
     loop_qubits: set[int]
-    kind: str  # 'X', 'Z' or 'pair'
+    kind: str  # 'X', 'Z', 'XL', 'ZL' (logical loops), 'pair' or 'reduce'
 
 
-NOTHING = "Nothing to simplify: no contractible loop in the word."
+NOTHING = "Nothing to simplify: no closed loop or repeated factor in the word."
 
 
 def build_script(lat: TorusLattice, word: PauliWord) -> tuple["Script | None", str]:
@@ -147,6 +246,15 @@ def build_script(lat: TorusLattice, word: PauliWord) -> tuple["Script | None", s
     if loop is None:
         loop = find_z_loop(lat, net)
         letter, kind = "Z", "Z"
+    logical: list[int] = []  # which logical qubits a non-contractible loop hits
+    if loop is None:
+        for letter, finder in (("X", find_logical_x_loop), ("Z", find_logical_z_loop)):
+            hit = finder(lat, net)
+            if hit is not None:
+                loop, cls = hit
+                logical = [i + 1 for i in (0, 1) if cls[i]]
+                kind = letter + "L"
+                break
 
     if loop is None:
         pair = find_pair(word)
@@ -162,11 +270,17 @@ def build_script(lat: TorusLattice, word: PauliWord) -> tuple["Script | None", s
         )
     else:
         loop_qubits = set(loop)
-        gens = "star" if kind == "X" else "plaquette"
-        opening = (
-            f"Contractible {letter}-loop on {len(loop)} qubits "
-            f"-- a product of {gens} stabilizers."
-        )
+        if logical:
+            opening = (
+                f"Non-contractible {letter}-loop on {len(loop)} qubits: it winds "
+                f"around the torus, so it is a logical operator."
+            )
+        else:
+            gens = "star" if kind == "X" else "plaquette"
+            opening = (
+                f"Contractible {letter}-loop on {len(loop)} qubits "
+                f"-- a product of {gens} stabilizers."
+            )
 
     factors = list(word.factors)
     phase = word.phase
@@ -270,6 +384,13 @@ def build_script(lat: TorusLattice, word: PauliWord) -> tuple["Script | None", s
         )
 
     lo = len(factors) - len(order)
+    if logical:
+        snaps += _logical_ending(
+            factors, phase, word.ket, uids, letter, logical, lo, set(loop_qubits)
+        )
+        for snap in snaps:
+            snap.ket = word.ket
+        return Script(snaps, set(loop_qubits), kind), opening
     if kind == "pair":
         gather = f"The two {letter}_{chosen[0].qubit + 1} factors now sit together."
         closing = f"{letter}{letter} = I, so the pair vanishes."
@@ -280,7 +401,8 @@ def build_script(lat: TorusLattice, word: PauliWord) -> tuple["Script | None", s
             f"the stabilizer."
         )
         closing = (
-            f"{gens}|00_L> = |00_L>: the stabilizer acts trivially, so it drops out."
+            f"{gens}{ket_label(word.ket)} = {ket_label(word.ket)}: the stabilizer "
+            f"acts trivially, so it drops out."
         )
     snaps.append(
         Snapshot(
@@ -300,7 +422,72 @@ def build_script(lat: TorusLattice, word: PauliWord) -> tuple["Script | None", s
             loop_qubits=set(loop_qubits),
         )
     )
+    for snap in snaps:
+        snap.ket = word.ket
     return Script(snaps, set(loop_qubits), kind), opening
+
+
+def _logical_ending(
+    factors: list[Factor],
+    phase: complex,
+    ket: tuple[int, int],
+    uids: set[int],
+    letter: str,
+    logical: list[int],
+    lo: int,
+    loop_qubits: set[int],
+) -> list[Snapshot]:
+    """The last three steps once a logical loop sits right in front of the ket.
+
+    The gathered loop is bracketed; then it is rewritten as the standard logical
+    operator it equals up to stabilizers; then that operator acts on the ket.
+    """
+    rest = [f for f in factors if f.uid not in uids]
+    ops = [f"({letter}_{i})_L" for i in logical]
+    ops_text = " ".join(ops)
+    n = len(factors) - lo
+    bracket = (lo, len(factors) - 1)
+
+    as_op = Segment(phase, rest, ket, ops)
+    if letter == "X":
+        new_ket = tuple(b ^ (i + 1 in logical) for i, b in enumerate(ket))
+        new_phase = phase
+        effect = (
+            f"{ops_text} flips logical qubit{'s' if len(ops) > 1 else ''} "
+            f"{' and '.join(map(str, logical))}: "
+            f"{ket_label(ket)} → {ket_label(new_ket)}."
+        )
+    else:
+        new_ket = ket
+        sign = (-1) ** sum(ket[i - 1] for i in logical)
+        new_phase = _snap(phase * sign)
+        bits = " and ".join(f"qubit {i} is {ket[i - 1]}" for i in logical)
+        effect = (
+            f"{ops_text} {ket_label(ket)} = {'-' if sign < 0 else ''}{ket_label(ket)}"
+            f": logical {bits}, so {'a sign' if sign < 0 else 'no sign'}."
+        )
+    acted = Segment(new_phase, rest, new_ket)
+
+    common = dict(highlight=set(uids), bracket=bracket, loop_qubits=loop_qubits)
+    return [
+        Snapshot(
+            factors=list(factors), phase=phase,
+            caption=f"All {n} factors of the loop now sit in front of the ket.",
+            **common,
+        ),
+        Snapshot(
+            factors=list(factors), phase=phase,
+            caption=(
+                f"Up to stabilizers the loop equals {ops_text}, "
+                f"which winds the same way round the torus."
+            ),
+            chain=[as_op], **common,
+        ),
+        Snapshot(
+            factors=list(factors), phase=phase, caption=effect,
+            chain=[as_op, acted], **common,
+        ),
+    ]
 
 
 REDUCE_NOTHING = "Nothing to reduce: every qubit already carries a single operator."
