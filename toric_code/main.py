@@ -89,6 +89,8 @@ class App:
         self.tween = 1.0
         self.step_timer = 0.0
         self.scroll = 0
+        self.scroll_nudge = 0       # mouse-wheel offset from the automatic scroll
+        self.result = None          # finished logical-loop equation, kept on screen
         self.auto = False           # play through and commit without clicks
         self.finish_timer = 0.0
         self.step_secs = STEP_SECONDS
@@ -98,7 +100,8 @@ class App:
         self.drag_kind: str | None = None
         self.drag_src: int | None = None
         self.drag_pos: tuple[int, int] | None = None
-        self.drag_target: int | None = None
+        self.drag_src_slot: tuple[int, int] = (0, 0)  # the drawn copy grabbed
+        self.drag_target: tuple[int, int] | None = None  # slot it would land on
         self.drag_pair: tuple[int, int] | None = None    # bound (vertex, face)
         self.drag_pair_target: tuple[int, int, int] | None = None  # (v, f, qubit)
         self.mouse_pos = (0, 0)
@@ -227,6 +230,9 @@ class App:
         if self.script:
             s = self.current_snapshot()
             return s.factors, s.phase, s.ket, s.chain
+        if self.result is not None:
+            r = self.result
+            return r.factors, r.phase, r.ket, r.chain
         return self.word.factors, self.word.phase, self.word.ket, []
 
     def display_net(self) -> dict[int, str]:
@@ -237,6 +243,7 @@ class App:
         return self.word.net()
 
     def push_undo(self) -> None:
+        self.result = None  # the word is about to change
         self.undo_stack.append(self.word.clone())
         if len(self.undo_stack) > 200:
             self.undo_stack.pop(0)
@@ -328,13 +335,15 @@ class App:
             self.word.factors = list(final.factors)
             self.word.phase = final.phase
             self.word.ket = final.ket
+            # keep the whole chain of equalities up until the next change
+            self.result = last if last.chain else None
             self.message = "Simplified."
         else:
             self.message = "Simplification cancelled."
         self.script = None
         self.playing = False
         self.auto = False
-        self.scroll = 0
+        self.scroll = self.scroll_nudge = 0
         self.step_secs, self.tween_secs = STEP_SECONDS, TWEEN_SECONDS
 
     def goto_step(self, delta: int) -> None:
@@ -343,6 +352,7 @@ class App:
         new = self.step + delta
         if 0 <= new < len(self.script.snapshots):
             self.step = new
+            self.scroll_nudge = 0
             self.tween = 0.0
             self.step_timer = 0.0
             if new == len(self.script.snapshots) - 1:
@@ -360,24 +370,58 @@ class App:
                 best, bestd = q, d
         return best
 
-    def vertex_at(self, pos, tol: float = 0.34) -> int | None:
-        """Vertex under the cursor. ``tol`` is a fraction of the grid spacing;
-        pass 0.5 while dragging so the drop always snaps to the nearest slot."""
+    def vertex_slot_at(self, pos, tol: float = 0.34, margin: int = 0):
+        """Drawing slot (col, row) of the vertex under the cursor.
+
+        ``tol`` is a fraction of the grid spacing; ``margin`` extra slots are
+        allowed beyond the drawn grid, where the torus continues periodically.
+        """
         col = round((pos[0] - self.ox) / self.spacing)
         row = round((pos[1] - self.oy) / self.spacing)
-        if not (0 <= col <= L and 0 <= row <= L):
+        if not (-margin <= col <= L + margin and -margin <= row <= L + margin):
             return None
         px, py = self.slot_px(col, row)
         if (px - pos[0]) ** 2 + (py - pos[1]) ** 2 > (self.spacing * tol) ** 2:
             return None
-        return self.lat.vertex(col % L, row % L)
+        return col, row
 
-    def face_at(self, pos) -> int | None:
+    def face_slot_at(self, pos, margin: int = 0):
+        """Lower-left slot (col, row) of the face under the cursor."""
         col = math.floor((pos[0] - self.ox) / self.spacing)
         row = math.floor((pos[1] - self.oy) / self.spacing)
-        if not (0 <= col < L and 0 <= row < L):
+        if not (-margin <= col < L + margin and -margin <= row < L + margin):
             return None
-        return self.lat.face(col, row)
+        return col, row
+
+    def vertex_at(self, pos, tol: float = 0.34) -> int | None:
+        slot = self.vertex_slot_at(pos, tol)
+        return None if slot is None else self.lat.vertex(*slot)
+
+    def face_at(self, pos) -> int | None:
+        slot = self.face_slot_at(pos)
+        return None if slot is None else self.lat.face(*slot)
+
+    def drag_hop(self, pos, kind: str, src: int):
+        """Where a dragged e or m would land: ``(site, slot, qubit)`` or None.
+
+        Only the four neighbours of the copy that was grabbed count, and they
+        may lie one step outside the drawn grid: the lattice wraps around, so
+        every anyon can leave through all four sides.
+        """
+        if kind == "e":
+            slot = self.vertex_slot_at(pos, tol=0.5, margin=1)
+        else:
+            slot = self.face_slot_at(pos, margin=1)
+        sx, sy = self.drag_src_slot
+        if slot is None or abs(slot[0] - sx) + abs(slot[1] - sy) != 1:
+            return None
+        if kind == "e":
+            site = self.lat.vertex(*slot)
+            q = self.lat.edge_between_vertices(src, site)
+        else:
+            site = self.lat.face(*slot)
+            q = self.lat.edge_between_faces(src, site)
+        return None if q is None else (site, slot, q)
 
     # ------------------------------------------------------------------
     # events
@@ -479,13 +523,15 @@ class App:
                     "No e next to an m here - shift-drag needs both. "
                     "A Y gate makes a bound pair."
                 )
-            v = self.vertex_at(pos)
-            if v is not None and v in e_sites:
-                self.drag_kind, self.drag_src, self.drag_pos = "e", v, pos
+            slot = self.vertex_slot_at(pos)
+            if slot is not None and self.lat.vertex(*slot) in e_sites:
+                self.drag_kind, self.drag_src = "e", self.lat.vertex(*slot)
+                self.drag_src_slot, self.drag_pos = slot, pos
                 return
-            f = self.face_at(pos)
-            if f is not None and f in m_sites:
-                self.drag_kind, self.drag_src, self.drag_pos = "m", f, pos
+            slot = self.face_slot_at(pos)
+            if slot is not None and self.lat.face(*slot) in m_sites:
+                self.drag_kind, self.drag_src = "m", self.lat.face(*slot)
+                self.drag_src_slot, self.drag_pos = slot, pos
                 return
             self.message = "Press on an anyon (e on a vertex, m in a face) to drag it."
             return
@@ -515,24 +561,21 @@ class App:
                 f"(Y = i X Z moves both)."
             )
             return
+        hop = self.drag_hop(pos, kind, src)
+        if hop is None:
+            here = self.vertex_slot_at(pos, 0.5, 1) if kind == "e" else \
+                self.face_slot_at(pos, 1)
+            if here is not None and here != self.drag_src_slot:
+                self.message = (
+                    "An e charge can only hop to a neighbouring vertex." if kind == "e"
+                    else "An m flux can only hop to a neighbouring face."
+                )
+            return
+        _, _, q = hop
         if kind == "e":
-            dst = self.vertex_at(pos, tol=0.5)
-            if dst is None or dst == src:
-                return
-            q = self.lat.edge_between_vertices(src, dst)
-            if q is None:
-                self.message = "An e charge can only hop to a neighbouring vertex."
-                return
             self.apply_gate(q, "Z")
             self.message = f"Moved e along qubit {q + 1} (Z applied)."
         else:
-            dst = self.face_at(pos)
-            if dst is None or dst == src:
-                return
-            q = self.lat.edge_between_faces(src, dst)
-            if q is None:
-                self.message = "An m flux can only hop to a neighbouring face."
-                return
             self.apply_gate(q, "X")
             self.message = f"Moved m across qubit {q + 1} (X applied)."
 
@@ -545,15 +588,8 @@ class App:
         if self.drag_kind == "eps":
             self.drag_pair_target = self.eps_best_move(event.pos)
             return
-        if self.drag_kind == "e":
-            dst = self.vertex_at(event.pos, tol=0.5)
-            ok = dst is not None and dst != self.drag_src and \
-                self.lat.edge_between_vertices(self.drag_src, dst) is not None
-        else:
-            dst = self.face_at(event.pos)
-            ok = dst is not None and dst != self.drag_src and \
-                self.lat.edge_between_faces(self.drag_src, dst) is not None
-        self.drag_target = dst if ok else None
+        hop = self.drag_hop(event.pos, self.drag_kind, self.drag_src)
+        self.drag_target = None if hop is None else hop[1]
 
     def on_button(self, key: str) -> None:
         if key in ("X", "Y", "Z", "Drag"):
@@ -571,6 +607,7 @@ class App:
         elif key == "Undo":
             if self.undo_stack:
                 self.word = self.undo_stack.pop()
+                self.result = None
                 self.tracker.undo_step()
                 self.message = "Undone."
             else:
@@ -580,6 +617,7 @@ class App:
                 self.push_undo()
                 self.tracker.begin_reset_step()
             self.word.clear()
+            self.result = None
             self.message = "Cleared board and worldline history."
         elif key == "Play":
             self.auto = False
@@ -803,29 +841,13 @@ class App:
                 self.draw_eps(tgt, alpha=0.38)
             self.draw_eps(self.drag_pos)
             return
-        src_pos = None
-        if self.drag_kind == "e":
-            slots = self.lat.vertex_slots(self.drag_src)
-            src_pos = min(
-                (self.slot_px(*s) for s in slots),
-                key=lambda p: (p[0] - self.drag_pos[0]) ** 2 + (p[1] - self.drag_pos[1]) ** 2,
-            )
-        else:
-            slots = self.lat.face_slots(self.drag_src)
-            src_pos = min(
-                (self.slot_px(s[0] + 0.5, s[1] + 0.5) for s in slots),
-                key=lambda p: (p[0] - self.drag_pos[0]) ** 2 + (p[1] - self.drag_pos[1]) ** 2,
-            )
+        off = 0.0 if self.drag_kind == "e" else 0.5  # vertices vs face centres
+        sx, sy = self.drag_src_slot
+        src_pos = self.slot_px(sx + off, sy + off)
         col = E_COL if self.drag_kind == "e" else M_COL
         if self.drag_target is not None:
-            if self.drag_kind == "e":
-                cands = [self.slot_px(*s) for s in self.lat.vertex_slots(self.drag_target)]
-            else:
-                cands = [
-                    self.slot_px(s[0] + 0.5, s[1] + 0.5)
-                    for s in self.lat.face_slots(self.drag_target)
-                ]
-            tgt = min(cands, key=lambda p: (p[0] - src_pos[0]) ** 2 + (p[1] - src_pos[1]) ** 2)
+            tx, ty = self.drag_target
+            tgt = self.slot_px(tx + off, ty + off)
             pygame.draw.line(self.screen, blend(col, BG, 0.55), src_pos, tgt, 4)
             aa_circle(self.screen, blend(col, BG, 0.4), tgt, self.qr + 4, 3)
         if self.drag_kind == "e":
@@ -988,7 +1010,8 @@ class App:
         """Lay the equation out as wrapped tokens -> {key: (x, y, w, h, text, bold)}.
 
         The main expression keys its factors by uid, so they can glide between
-        steps; each further ``= ...`` link ``i`` keys its tokens by ``(i, ...)``.
+        steps; each further ``= ...`` link ``i`` keys its tokens by ``(i, ...)``
+        and starts a line of its own.
         """
         gap = 9
         # (key, text, bold, glue): a glued token never ends a line on its own
@@ -1021,7 +1044,8 @@ class App:
             while tokens[j][3] and j + 1 < len(tokens):
                 j += 1
                 need += gap + sizes[j][0]
-            if x > area.x and x + need > area.right:
+            new_link = isinstance(key, tuple) and key[1] == "="
+            if x > area.x and (new_link or x + need > area.right):
                 x = area.x
                 y += LINE_H
             w, h = sizes[k]
@@ -1053,8 +1077,16 @@ class App:
                     focus_line = (layout[key][1] - area.y) // LINE_H
         if focus_line is None:
             focus_line = max(0, n_lines - 1)
+            if chain:
+                # the newest link, from its first line
+                key = (len(chain) - 1, "=")
+                focus_line = min(
+                    focus_line, (layout[key][1] - area.y) // LINE_H + STATE_LINES - 1
+                )
         max_scroll = max(0, n_lines - STATE_LINES)
-        self.scroll = max(0, min(max_scroll, focus_line - STATE_LINES + 1))
+        auto = max(0, min(max_scroll, focus_line - STATE_LINES + 1))
+        self.scroll = max(0, min(max_scroll, auto + self.scroll_nudge))
+        self.scroll_nudge = self.scroll - auto  # never wind up past either end
         dy = -self.scroll * LINE_H
 
         clip = surf.get_clip()
@@ -1168,6 +1200,10 @@ class App:
             self.on_mouse_up(event)
         elif event.type == pygame.MOUSEMOTION:
             self.on_mouse_motion(event)
+        elif event.type == pygame.MOUSEWHEEL:
+            # scroll the equation when it is longer than the visible lines
+            if self.mouse_pos[1] > self.H - BOTTOM_H and self.mouse_pos[0] < self.canvas_right:
+                self.scroll_nudge -= event.y
         elif event.type == pygame.KEYDOWN:
             self.on_key(event)
         return True

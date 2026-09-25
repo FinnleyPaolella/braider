@@ -355,22 +355,18 @@ def build_script(lat: TorusLattice, word: PauliWord) -> tuple["Script | None", s
         flips = [p for p in passed if anticommute(p, f)]
         factors.insert(target, f)
         phase = _snap(phase * (-1) ** len(flips))
+        if not flips:
+            # only passes factors on other qubits: shown together with the
+            # next step that matters
+            continue
 
         plural = "s" if len(passed) != 1 else ""
-        if not passed:
-            caption = f"{f.label()} already sits next to the ket."
-        elif flips:
-            names = ", ".join(sorted({p.label() for p in flips}))
-            caption = (
-                f"Commute {f.label()} right past {len(passed)} factor{plural}: "
-                f"it anticommutes with {names}, giving {len(flips)} sign flip"
-                f"{'s' if len(flips) != 1 else ''} -- phase now {_phase_name(phase)}."
-            )
-        else:
-            caption = (
-                f"Commute {f.label()} right past {len(passed)} factor{plural}: "
-                f"all on other qubits, so no sign."
-            )
+        names = ", ".join(sorted({p.label() for p in flips}))
+        caption = (
+            f"Commute {f.label()} right past {len(passed)} factor{plural}: "
+            f"it anticommutes with {names}, giving {len(flips)} sign flip"
+            f"{'s' if len(flips) != 1 else ''} -- phase now {_phase_name(phase)}."
+        )
         snaps.append(
             Snapshot(
                 factors=list(factors),
@@ -530,37 +526,21 @@ def build_reduce_script(word: PauliWord) -> tuple["Script | None", str]:
         )
 
         # slide them together at the leftmost one; everything crossed on the way
-        # sits on another qubit, so nothing picks up a sign
+        # sits on another qubit, so nothing picks up a sign and the slide gets
+        # no step of its own
         dest = idxs[0]
+        moved_any = idxs != list(range(dest, dest + len(group)))
         for k, g in enumerate(group[1:], start=1):
             old = _index_of(factors, g.uid)
-            target = dest + k
-            moved = factors.pop(old)
-            passed = factors[target:old]
-            factors.insert(target, moved)
-            plural = "s" if len(passed) != 1 else ""
-            snaps.append(
-                Snapshot(
-                    factors=list(factors),
-                    phase=phase,
-                    caption=(
-                        f"{g.label()} slides left past {len(passed)} factor{plural} "
-                        f"on other qubits -- they commute, no sign."
-                        if passed
-                        else f"{g.label()} already sits next to it."
-                    ),
-                    highlight=set(uids),
-                    moving=g.uid,
-                    loop_qubits={q},
-                )
-            )
+            factors.insert(dest + k, factors.pop(old))
 
         local, letter = _reduce_letters(g.letter for g in group)
+        gathered = "Gathered (other qubits commute, no sign): " if moved_any else ""
         snaps.append(
             Snapshot(
                 factors=list(factors),
                 phase=phase,
-                caption=f"{shown} = {_term(local, letter, q)}.",
+                caption=f"{gathered}{shown} = {_term(local, letter, q)}.",
                 highlight=set(uids),
                 bracket=(dest, dest + len(group) - 1),
                 loop_qubits={q},
