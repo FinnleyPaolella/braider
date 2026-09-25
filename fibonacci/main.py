@@ -38,6 +38,7 @@ import pygame.gfxdraw
 
 import render
 import ui
+import webcanvas
 from anyons import basis, initial_state
 from gates import GATES
 from steps import (
@@ -301,7 +302,10 @@ class App:
         want_w = self.panel_w + MID_W + 2 * MARGIN + ref_w
         w = min(want_w, max(1200, info.current_w - 60)) if info.current_w > 0 else want_w
         h = min(WINDOW_H, max(800, info.current_h - 110)) if info.current_h > 0 else WINDOW_H
-        self.screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+        page = webcanvas.viewport()
+        if page:  # in the browser: fill the page
+            w, h = max(1200, page[0]), max(800, page[1])
+        self.set_mode((w, h))
         self.clock = pygame.time.Clock()
         self.font_small = render.sysfont(FONT_STACK, 13)
         f = render.fonts()
@@ -348,6 +352,12 @@ class App:
     # ------------------------------------------------------------------
     # layout
     # ------------------------------------------------------------------
+    def set_mode(self, size: tuple[int, int]) -> None:
+        # the browser page is resized by webcanvas.poll, not by SDL
+        flags = 0 if webcanvas.WEB else pygame.RESIZABLE
+        self.screen = pygame.display.set_mode(size, flags)
+        webcanvas.fit(size, BG)
+
     def ref_width(self) -> int:
         return max(render.f_matrix_panel().get_width(), render.r_matrix_panel().get_width())
 
@@ -967,6 +977,9 @@ class App:
     async def run(self) -> None:
         while True:
             dt = self.clock.tick(120) / 1000.0
+            page = webcanvas.poll(dt)
+            if page:
+                self.set_mode((max(1200, page[0]), max(800, page[1])))
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
                     return

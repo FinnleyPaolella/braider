@@ -20,6 +20,7 @@ from pauli import PauliWord, phase_prefix
 from simplify import build_reduce_script, build_script
 from viewer3d import WorldlinePanel
 from worldlines import WorldlineTracker
+import webcanvas
 from ui import (
     ACCENT, BG, E_COL, GATE_COL, GLOW, GRID, GRID_GHOST, HAIRLINE, INK,
     INK_FAINT, INK_SOFT, M_COL, PANEL, WHITE, X_COL, Y_COL, Z_COL,
@@ -64,7 +65,11 @@ class App:
         info = pygame.display.Info()
         self.W = min(1440, max(1100, info.current_w - 80))
         self.H = min(940, max(780, info.current_h - 120))
+        page = webcanvas.viewport()
+        if page:  # in the browser: fill the page
+            self.W, self.H = max(1100, page[0]), max(780, page[1])
         self.screen = pygame.display.set_mode((self.W, self.H))
+        webcanvas.fit((self.W, self.H), BG)
         self.clock = pygame.time.Clock()
         self.fonts = Fonts()
 
@@ -99,7 +104,8 @@ class App:
 
         self.time = 0.0
         self.base_W = self.W
-        self.max_W = max(self.W, min(2200, info.current_w - 60))
+        # in the browser the page is the limit, so the grid shrinks instead
+        self.max_W = self.W if page else max(self.W, min(2200, info.current_w - 60))
         self.world = WorldlinePanel(self.lat, self.tracker, self.fonts)
         self._layout_grid()
         self._build_buttons()
@@ -286,6 +292,7 @@ class App:
         want = self.base_W + WORLD_W if self.split else self.base_W
         self.W = min(self.max_W, want)
         self.screen = pygame.display.set_mode((self.W, self.H))
+        webcanvas.fit((self.W, self.H), BG)
         self._layout_grid()
         self._build_buttons()
         if self.split:
@@ -293,6 +300,15 @@ class App:
             self.message = "Worldlines shown - the grid stays live."
         else:
             self.message = "Worldline panel hidden."
+
+    def fit_page(self, page: tuple[int, int]) -> None:
+        """Refill the browser page after it was resized."""
+        self.W, self.H = max(1100, page[0]), max(780, page[1])
+        self.base_W = self.max_W = self.W
+        self.screen = pygame.display.set_mode((self.W, self.H))
+        webcanvas.fit((self.W, self.H), BG)
+        self._layout_grid()
+        self._build_buttons()
 
     def close_script(self) -> None:
         if self.script and self.step == len(self.script.snapshots) - 1:
@@ -1100,6 +1116,9 @@ class App:
         running = True
         while running:
             dt = self.clock.tick(60) / 1000.0
+            page = webcanvas.poll(dt)
+            if page:
+                self.fit_page(page)
             for event in pygame.event.get():
                 if not self.dispatch(event):
                     running = False
