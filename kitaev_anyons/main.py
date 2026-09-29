@@ -1,3 +1,9 @@
+# /// script
+# dependencies = [
+#     "numpy",
+# ]
+# ///
+
 """Majorana fermions in a fixed Z2 gauge field on a finite honeycomb cluster.
 
 Run with:  python main.py
